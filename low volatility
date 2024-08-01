@@ -1,0 +1,210 @@
+# low volatility
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from heapq import nlargest, nsmallest
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+TRADING_DAYS = 252
+# Load data
+data = pd.read_excel("sp500.xlsx", sheet_name="updated")
+ind = data[data['date'] == '2000-01-03'].index[0]
+data = data.iloc[ind:]
+data['date'] = pd.to_datetime(data['date']).apply(lambda x: x.strftime('%Y-%m-%d'))
+
+# Create tickers dictionary
+tickers = {data['date'][i]: data['tickers'][i].split(",") for i in range(ind, len(data)+ind)}
+
+# risk-free rate
+risk_free_data = yf.download('^IRX', start="1999-01-01", end="2024-04-01")
+risk_free_data['Risk-Free Rate'] = risk_free_data['Adj Close'] / 100
+
+
+# Initialize parameters
+date_format = "%Y-%m-%d"
+commission = 0.0005
+
+# Create date range
+month_end_range = pd.date_range('1-Jan-2002','1-Mar-2024', freq='M').strftime("%Y-%m-%d").tolist()
+dates_list = list(tickers.keys())
+
+# Collect all tickers
+all_tickers = set()
+for t in tickers.values():
+    all_tickers.update(t)
+all_tickers = list(all_tickers)
+# remove problematic tickers
+tickers_to_remove = ['TIE', 'BSC', 'BDK', 'CBE', 'ACS', 'MEE', 'BOL']
+filtered_tickers = [ticker for ticker in all_tickers if ticker not in tickers_to_remove]
+
+# Download all historical data
+historical_data = yf.download(filtered_tickers, start="1999-01-01", end="2024-04-01", group_by='ticker')
+
+# helper functions
+def get_previous_date(dates_list, target_date_str):
+    dates = [datetime.strptime(date, '%Y-%m-%d') for date in dates_list]
+    target_date = datetime.strptime(target_date_str, '%Y-%m-%d')
+    dates.sort()
+    previous_date = None
+    for date in dates:
+        if date >= target_date:
+            break
+        previous_date = date
+    return previous_date.strftime('%Y-%m-%d') if previous_date else None
+
+def one_day_after(date_str):
+    date_format = "%Y-%m-%d"
+    date_obj = datetime.strptime(date_str, date_format)
+    one_day_after = date_obj + timedelta(days=1)
+    return one_day_after.strftime(date_format)
+
+
+# compute volatility on three-year period
+def calculate_vol(data):
+    returns = np.log(data['Adj Close']/data['Adj Close'].shift(1))
+    returns.fillna(0, inplace=True)
+    volatility = returns.rolling(window=TRADING_DAYS * 3).std() * np.sqrt(TRADING_DAYS)
+    return volatility
+
+# Initialize an empty DataFrame to store volatilities
+volatilities = pd.DataFrame(index=historical_data.index)
+
+# Iterate over each ticker
+for ticker in historical_data.columns.levels[0]:
+    adj_close_data = historical_data[ticker].loc[:, 'Adj Close'].to_frame()
+    volatilities[ticker] = calculate_vol(adj_close_data)
+
+"""
+# Drop NaN values if necessary
+volatilities.dropna(inplace=True)
+
+# Plot the rolling volatility for a specific ticker (optional)
+volatilities['TSLA'].plot(figsize=(14, 7))
+plt.title('3-Year Rolling Volatility')
+plt.xlabel('Date')
+plt.ylabel('Volatility')
+plt.show()
+"""
+
+def strategy_performance():
+    results = []
+    for date in month_end_range:
+        strategy_returns = 0
+        number_of_stocks = 0
+        nearest_date = get_previous_date(dates_list, date)
+        stock_list = tickers[nearest_date]
+        stock_vol_dict = {}
+        for stock in stock_list:
+            if stock not in historical_data:
+                #print(f"Missing data for stock: {stock}")
+                continue
+            stock_vol_dict[stock] = volatilities[stock][nearest_date]
+        # delete 0 volatilities because if vol for a stock is 0, it's mostly data error.
+        stock_vol_dict = {k: v for k,v in stock_vol_dict.items() if v != 0}
+        low_vol_stocks = nsmallest(10, stock_vol_dict, key=stock_vol_dict.get)
+        for stock in low_vol_stocks:
+            entry_date = one_day_after(date)
+            original_date = datetime.strptime(entry_date, date_format)
+            one_month_later = original_date + timedelta(days=30)
+            exit_date = one_day_after(one_month_later.strftime(date_format))
+            
+            if stock not in historical_data:
+                continue
+            prices = historical_data[stock].loc[entry_date:exit_date]
+            try:
+                entry_price = prices.iloc[0]['Adj Close'] * (1 + commission)
+                exit_price = prices.iloc[-1]['Adj Close'] * (1 - commission)
+                monthly_stock_return = exit_price / entry_price -1
+                
+            except Exception as e:
+                print(f"Error calculating short return for {stock}: {e}")
+                monthly_stock_return = 0
+            if pd.notna(monthly_stock_return):
+                strategy_returns += monthly_stock_return
+                number_of_stocks += 1
+        results.append(strategy_returns / number_of_stocks)
+    return results
+results = strategy_performance()
+
+def annualied_geometric_return(returns): 
+    returns = [i + 1 for i in returns]
+    cumulative_returns = np.cumprod(returns)
+    geometric_return = cumulative_returns[-1] ** (1/len(cumulative_returns)) - 1
+    annualized_return = (1 + geometric_return) ** 12 -1
+    return annualized_return
+annualized_return = annualied_geometric_return(results)
+print("Annual return is " + "{:.2%}".format(annualized_return))
+
+
+# Plot results
+# Ensure month_end_range is a DatetimeIndex
+month_end_range_index = pd.to_datetime(month_end_range)
+
+# Create the returns Series
+returns = pd.Series(results, index=month_end_range_index)
+cumulative_returns = (1 + returns).cumprod()
+
+plt.figure(figsize=(14, 7))
+plt.plot(cumulative_returns, label='Low Volatility Strategy')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.legend()
+plt.title('Low Volatility Strategy Performance')
+
+# Set major locator to year and format to only show year
+ax = plt.gca()
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+
+plt.show()
+
+
+def calculate_max_drawdown(returns):
+    returns = [i+1 for i in returns]
+    cumulative_returns = np.cumprod(returns)
+    peak = np.maximum.accumulate(cumulative_returns)
+    drawdown = (cumulative_returns - peak) / peak
+    max_drawdown = np.min(drawdown)
+    return max_drawdown
+max_drawdown = calculate_max_drawdown(results)
+print("Maximum Drawdown:", "{:.2%}".format(max_drawdown))
+
+
+def calculate_sharpe_ratio(returns): 
+    monthly_returns = returns    
+    annual_risk_free_rate = risk_free_data['Risk-Free Rate'].mean()
+    monthly_risk_free_rate = (1 + annual_risk_free_rate)**(1/12) - 1
+    average_return = np.mean(monthly_returns)    
+    std_dev_returns = np.std(monthly_returns, ddof=1)
+    excess_return = average_return - monthly_risk_free_rate    
+    sharpe_ratio = excess_return / std_dev_returns
+    return sharpe_ratio
+sharpe_ratio = calculate_sharpe_ratio(returns)
+print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+
+
+
+market_data = yf.download('^GSPC', start="2002-01-31", end="2024-03-01")
+market_returns = market_data['Adj Close'].pct_change().fillna(0)
+first_date = month_end_range[0]
+last_date = '2024-02-29'
+
+# Define the starting and ending values and the number of years
+start_value = market_data['Adj Close'][first_date]
+end_value = market_data['Adj Close'][last_date]
+start_date = pd.to_datetime("2002-01-31")
+end_date = pd.to_datetime(last_date)
+n_years = (end_date - start_date).days / 365.25
+
+# Calculate the compound annual growth rate (CAGR)
+cagr = ((end_value / start_value) ** (1 / n_years)) - 1
+print("Annual market return is " + "{:.2%}".format(cagr))
+market_max_drawdown = calculate_max_drawdown(market_returns)
+print("Maximum Drawdown:", "{:.2%}".format(market_max_drawdown))
+sharpe_ratio_market = calculate_sharpe_ratio(market_returns)
+sharpe_ratio_market
